@@ -6,21 +6,42 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "start:all": "node scripts/start-production.js",
+    "worker": "npx tsx worker/index.ts",
+    "worker:dev": "npx tsx --watch worker/index.ts",
+    "worker:scheduler": "npx tsx worker/scheduler.ts",
+    "lint": "eslint",
+    "db:push": "npx prisma db push",
+    "db:seed": "npx tsx prisma/seed.ts",
+    "db:generate": "npx prisma generate",
+    "db:studio": "npx prisma studio"
+  },
+  "prisma": {
+    "seed": "npx tsx prisma/seed.ts"
   },
   "dependencies": {
+    "@prisma/client": "^6.8.0",
+    "bcryptjs": "^3.0.3",
+    "bullmq": "^6.3.2",
+    "dotenv": "^17.4.2",
+    "ioredis": "^6.0.0",
+    "jsonwebtoken": "^9.0.3",
     "next": "16.3.3",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.3",
+    "prisma": "^6.8.0",
     "tailwindcss": "^4",
+    "tsx": "^4.0.0",
     "typescript": "^5"
   }
 }

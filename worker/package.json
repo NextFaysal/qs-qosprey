@@ -1,0 +1,20 @@
+{
+  "name": "pepeshops-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "npx tsx --watch index.ts",
+    "start": "npx tsx index.ts",
+    "scheduler": "npx tsx scheduler.ts"
+  },
+  "dependencies": {
+    "bullmq": "^5.0.0",
+    "ioredis": "^5.4.0",
+    "@prisma/client": "^6.0.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

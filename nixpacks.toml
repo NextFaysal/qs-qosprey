@@ -1,0 +1,17 @@
+# Nixpacks Configuration for PepeShops
+# Compatible with Railway, Coolify, Zeabur, Render, Dokku, Easypanel
+
+[phases.setup]
+nixPkgs = ["nodejs_20", "openssl"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[phases.build]
+cmds = [
+  "npx prisma generate",
+  "npm run build"
+]
+
+[start]
+cmd = "node scripts/start-production.js"

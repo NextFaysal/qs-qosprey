@@ -469,10 +469,22 @@ export default function DashboardPage() {
     setCampaignSubmitting(true);
 
     try {
+      // Ensure publishTime includes the user's browser timezone offset (converted to UTC ISO)
+      let isoPublishTime = campaignForm.publishTime;
+      if (campaignForm.publishTime) {
+        const d = new Date(campaignForm.publishTime);
+        if (!isNaN(d.getTime())) {
+          isoPublishTime = d.toISOString();
+        }
+      }
+
       const res = await fetch("/api/campaigns", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(campaignForm),
+        body: JSON.stringify({
+          ...campaignForm,
+          publishTime: isoPublishTime,
+        }),
       });
 
       const data = await res.json();
@@ -499,10 +511,22 @@ export default function DashboardPage() {
     setEditSubmitting(true);
 
     try {
+      // Ensure edit publishTime includes user's browser timezone offset (converted to UTC ISO)
+      let isoPublishTime = editForm.publishTime;
+      if (editForm.publishTime) {
+        const d = new Date(editForm.publishTime);
+        if (!isNaN(d.getTime())) {
+          isoPublishTime = d.toISOString();
+        }
+      }
+
       const res = await fetch(`/api/campaigns/${editForm.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(editForm),
+        body: JSON.stringify({
+          ...editForm,
+          publishTime: isoPublishTime,
+        }),
       });
 
       const data = await res.json();

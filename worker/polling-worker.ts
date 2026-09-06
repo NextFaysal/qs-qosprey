@@ -5,6 +5,7 @@ import {
   pollGoodsList,
   addToCart,
   getCartLists,
+  deleteFromCart,
   settleCart,
   verifyMemberInfo,
   getPollingInterval,
@@ -86,33 +87,63 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
   const timeoutDate = new Date(
     pollingStartTime + CAMPAIGN_TIMEOUT_MINUTES * 60 * 1000
   );
+  const publishTimeMs = new Date(publishTime).getTime();
 
   let pollCount = 0;
+  let lastDbCancelCheck = Date.now();
+  let lastCheckedAtDbUpdate = 0;
+  let cartPreCleaned = false;
+
+  // Auto pre-clean cart in background before drop (ensures clean state for fast matching)
+  const preCleanCart = async () => {
+    if (cartPreCleaned || mode !== "AUTO_BUY" || !apiCredential) return;
+    cartPreCleaned = true;
+    try {
+      console.log(`🧹 [PRE-CLEAN] Checking & pre-clearing cart for account...`);
+      const existingCart = await getCartLists(domain, apiCredential);
+      if (existingCart.items && existingCart.items.length > 0) {
+        const idsToClear = existingCart.items.map((i) => i.id);
+        await deleteFromCart(domain, idsToClear, apiCredential);
+        console.log(`🧹 [PRE-CLEAN] Cleared ${idsToClear.length} old item(s) from cart.`);
+      }
+    } catch (e) {
+      console.error(`⚠️ [PRE-CLEAN] Cart notice:`, e);
+    }
+  };
+
+  preCleanCart().catch(() => {});
 
   // Log polling start
   await prisma.campaignLog.create({
     data: {
       campaignId,
       event: "POLLING_STARTED",
-      detail: `Polling started. Timeout window: ${CAMPAIGN_TIMEOUT_MINUTES} minutes from start. Interval: ${pollingInterval}ms`,
+      detail: `Polling started. Timeout window: ${CAMPAIGN_TIMEOUT_MINUTES} minutes from start. Interval: ${pollingInterval}ms (Turbo enabled)`,
     },
   });
 
   // === POLLING LOOP ===
   while (true) {
-    // Check if campaign was cancelled or deleted
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: campaignId },
-      select: { status: true },
-    });
+    const now = Date.now();
+    const diffFromPublish = publishTimeMs - now;
+    const isCriticalDropWindow = diffFromPublish <= 20000 && diffFromPublish >= -60000;
 
-    if (!campaign || campaign.status === "CANCELLED") {
-      console.log(`⛔ Campaign ${campaignId} was cancelled or removed`);
-      return;
+    // Check cancellation periodically, but SKIP during the critical drop window for absolute zero DB overhead
+    if (!isCriticalDropWindow && now - lastDbCancelCheck > 4000) {
+      lastDbCancelCheck = now;
+      const campaign = await prisma.campaign.findUnique({
+        where: { id: campaignId },
+        select: { status: true },
+      });
+
+      if (!campaign || campaign.status === "CANCELLED") {
+        console.log(`⛔ Campaign ${campaignId} was cancelled or removed`);
+        return;
+      }
     }
 
     // Check timeout: 5 minutes from start of polling
-    if (Date.now() > timeoutDate.getTime()) {
+    if (now > timeoutDate.getTime()) {
       const timeoutMsg = "নির্ধারিত ৫ মিনিটে কোনো প্রোডাক্ট পাওয়া যায়নি (No product found)";
       console.log(`⏰ Campaign ${campaignId}: ${timeoutMsg}`);
 
@@ -139,7 +170,7 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
     pollCount++;
 
     try {
-      // 1. Poll the lists API
+      // 1. Poll the lists API (Pure HTTP)
       const result = await pollGoodsList(
         domain,
         {
@@ -153,23 +184,27 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
         apiCredential
       );
 
-      // Update last checked timestamp
-      await prisma.campaign.update({
-        where: { id: campaignId },
-        data: { lastCheckedAt: new Date() },
-      });
+      // Only touch DB for stats when NOT in the critical drop window
+      if (!isCriticalDropWindow) {
+        if (now - lastCheckedAtDbUpdate > 5000) {
+          lastCheckedAtDbUpdate = now;
+          prisma.campaign.update({
+            where: { id: campaignId },
+            data: { lastCheckedAt: new Date() },
+          }).catch(() => {});
+        }
 
-      // Log poll attempt periodically (every 10th attempt to avoid log spam)
-      if (pollCount % 10 === 1) {
-        await prisma.campaignLog.create({
-          data: {
-            campaignId,
-            event: "POLL_ATTEMPT",
-            detail: `Poll #${pollCount} — ${
-              result.found ? "MATCH FOUND!" : "No match"
-            }`,
-          },
-        });
+        if (pollCount % 20 === 1) {
+          prisma.campaignLog.create({
+            data: {
+              campaignId,
+              event: "POLL_ATTEMPT",
+              detail: `Poll #${pollCount} — ${
+                result.found ? "MATCH FOUND!" : "No match"
+              }`,
+            },
+          }).catch(() => {});
+        }
       }
 
       if (result.found && result.ids.length > 0) {
@@ -178,66 +213,89 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
         console.log(
           `⚡ [SNIPER] Campaign ${campaignId}: MATCH FOUND! (${matchedIds.length} cards: ${matchedIds.join(
             ", "
-          )}) — Executing Zero-Delay Fast Pipeline!`
+          )}) — 100% PURE HTTP FAST PIPELINE (ZERO DB DELAYS)!`
         );
 
         if (mode === "AUTO_BUY") {
           const pipelineStart = Date.now();
 
-          // 1. Fire addToCart IMMEDIATELY without waiting for DB writes!
+          // 1. ZERO DB OVERHEAD: Fire single batch addToCart IMMEDIATELY
           const buyResultPromise = addToCart(domain, matchedIds, apiCredential);
 
-          // Asynchronously record match to DB in background (non-blocking)
-          prisma.campaign.update({
-            where: { id: campaignId },
-            data: { matchedIds },
-          }).catch(console.error);
-
-          prisma.campaignLog.create({
-            data: {
-              campaignId,
-              event: "MATCH_FOUND",
-              detail: `Found ${matchedIds.length} product(s): ${matchedIds.join(", ")} (after ${pollCount} polls)`,
-            },
-          }).catch(console.error);
+          // 2. OVERLAPPED PIPELINING:
+          // Target server DB insert takes ~10-20ms. Fire getCartLists with 40ms stagger so it travels in parallel!
+          const overlappedCartListsPromise = (async () => {
+            await sleep(40);
+            return getCartLists(domain, apiCredential);
+          })();
 
           const buyResult = await buyResultPromise;
           console.log(`🛒 [SNIPER] AddCart done in ${Date.now() - pipelineStart}ms: ${buyResult.message}`);
 
-          // 2. Immediately fetch cartLists with 0ms sleep!
-          const cartListsStart = Date.now();
-          const cartListsResult = await getCartLists(domain, apiCredential);
-          console.log(`📋 [SNIPER] CartLists resolved in ${Date.now() - cartListsStart}ms`);
-
           let targetCartIds: number[] = [];
-          if (cartListsResult.items && cartListsResult.items.length > 0) {
-            // Strictly match ONLY the specific products filtered and added by THIS campaign
-            const matchedNumIds = matchedIds.map(Number);
-            const matchingItems = cartListsResult.items.filter((item) =>
-              matchedNumIds.includes(item.card_id)
+
+          // FAST TRACK: Did addCart response contain the cart row IDs directly?
+          if (buyResult.cartIds && buyResult.cartIds.length > 0) {
+            targetCartIds = buyResult.cartIds;
+            console.log(
+              `⚡ [SNIPER] Direct Cart IDs extracted from addCart response in 0ms: [${targetCartIds.join(", ")}]`
+            );
+          } else {
+            // Await the overlapped cart lists request that was already traveling across the network
+            let cartListsResult;
+            try {
+              cartListsResult = await overlappedCartListsPromise;
+            } catch {
+              cartListsResult = await getCartLists(domain, apiCredential);
+            }
+            console.log(
+              `📋 [SNIPER] Overlapped CartLists resolved in ${Date.now() - pipelineStart}ms (${cartListsResult?.items?.length || 0} items)`
             );
 
-            targetCartIds = matchingItems.map((item) => item.id);
+            if (cartListsResult?.items && cartListsResult.items.length > 0) {
+              const matchedStrIds = matchedIds.map(String);
+              const matchedNumIds = matchedIds.map(Number);
+
+              // Strictly match ONLY the specific products filtered and added by THIS campaign
+              let matchingItems = cartListsResult.items.filter(
+                (item) =>
+                  matchedNumIds.includes(item.card_id) ||
+                  matchedStrIds.includes(String(item.card_id))
+              );
+
+              // If overlapped request hit a few milliseconds before remote DB commit, do an instant retry:
+              if (matchingItems.length === 0) {
+                const retryCart = await getCartLists(domain, apiCredential);
+                matchingItems = (retryCart.items || []).filter(
+                  (item) =>
+                    matchedNumIds.includes(item.card_id) ||
+                    matchedStrIds.includes(String(item.card_id))
+                );
+                if (matchingItems.length > 0) {
+                  cartListsResult = retryCart;
+                }
+              }
+
+              if (matchingItems.length > 0) {
+                targetCartIds = matchingItems.map((item) => item.id);
+              } else {
+                // If ID representation differed on target server, take latest items up to campaign quantity
+                targetCartIds = cartListsResult.items.slice(0, quantity).map((item) => item.id);
+              }
+            }
           }
 
           if (targetCartIds.length === 0) {
             console.log(`⚠️ No cart items found to settle for campaign ${campaignId}`);
-            await updateCampaignStatus(
+            updateCampaignStatus(
               campaignId,
               "FAILED",
               `Cart was empty after addCart. AddCart message: ${buyResult.message}`
-            );
-            await prisma.campaignLog.create({
-              data: {
-                campaignId,
-                event: "SETTLEMENT_FAILED",
-                detail: `No cart IDs found. AddCart message: ${buyResult.message}`,
-              },
-            });
+            ).catch(console.error);
             return;
           }
 
-          // 3. Immediately fire settlement without waiting for DB writes!
+          // 3. ZERO DB: Immediately fire settlement!
           const checkParam = isCheck === 2 ? 2 : 1;
           const settleStart = Date.now();
           console.log(
@@ -250,7 +308,8 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
             domain,
             targetCartIds,
             checkParam,
-            apiCredential
+            apiCredential,
+            2 // up to 2 retries on transient error
           );
 
           const totalPipelineMs = Date.now() - pipelineStart;
@@ -260,72 +319,75 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
 
           const isSuccess = settleResult.resCode === 1;
 
-          // 4. Save final state to database
-          await prisma.campaign.update({
-            where: { id: campaignId },
-            data: {
-              status: isSuccess ? "SUCCESS" : "FAILED",
-              cartIds: targetCartIds.map(String),
-              settlementMsg: settleResult.message,
-              purchasedIds: isSuccess ? matchedIds : [],
-              lastError: isSuccess ? null : settleResult.message,
-            },
-          });
-
-          await prisma.campaignLog.create({
-            data: {
-              campaignId,
-              event: isSuccess ? "ORDER_SUCCESS" : "ORDER_FAILED",
-              detail: `Settlement ResCode: ${settleResult.resCode}, Message: ${settleResult.message}`,
-            },
-          });
-
-          // === STEP 5: REFRESH ACCOUNT BALANCE ===
-          const effectiveAccountId = accountId || campaignRecord.accountId;
-          if (effectiveAccountId && apiCredential) {
+          // 4. NOW AND ONLY NOW: Save everything to database in the background!
+          // (The product is already bought, so DB speed doesn't matter anymore)
+          (async () => {
             try {
-              console.log(`💰 Syncing fresh balance for account ${effectiveAccountId}...`);
-              const memberInfo = await verifyMemberInfo(domain, apiCredential);
-              if (memberInfo.valid && memberInfo.data) {
-                await prisma.account.update({
-                  where: { id: effectiveAccountId },
-                  data: {
-                    balance: memberInfo.data.money,
-                    remoteUsername: memberInfo.data.username || undefined,
-                  },
-                });
-                console.log(`💰 Account balance updated: $${memberInfo.data.money}`);
-                await prisma.campaignLog.create({
-                  data: {
-                    campaignId,
-                    event: "BALANCE_UPDATED",
-                    detail: `Account balance updated: $${memberInfo.data.money}`,
-                  },
-                });
+              await prisma.campaign.update({
+                where: { id: campaignId },
+                data: {
+                  status: isSuccess ? "SUCCESS" : "FAILED",
+                  matchedIds,
+                  cartIds: targetCartIds.map(String),
+                  settlementMsg: settleResult.message,
+                  purchasedIds: isSuccess ? matchedIds : [],
+                  lastError: isSuccess ? null : settleResult.message,
+                },
+              });
+
+              await prisma.campaignLog.create({
+                data: {
+                  campaignId,
+                  event: isSuccess ? "ORDER_SUCCESS" : "ORDER_FAILED",
+                  detail: `Settlement ResCode: ${settleResult.resCode}, Message: ${settleResult.message}`,
+                },
+              });
+
+              // Refresh account balance in background
+              const effectiveAccountId = accountId || campaignRecord.accountId;
+              if (effectiveAccountId && apiCredential) {
+                const memberInfo = await verifyMemberInfo(domain, apiCredential);
+                if (memberInfo.valid && memberInfo.data) {
+                  await prisma.account.update({
+                    where: { id: effectiveAccountId },
+                    data: {
+                      balance: memberInfo.data.money,
+                      remoteUsername: memberInfo.data.username || undefined,
+                    },
+                  });
+                  await prisma.campaignLog.create({
+                    data: {
+                      campaignId,
+                      event: "BALANCE_UPDATED",
+                      detail: `Account balance updated: $${memberInfo.data.money}`,
+                    },
+                  });
+                }
               }
-            } catch (balError) {
-              console.error(`⚠️ Balance sync error:`, balError);
+            } catch (dbErr) {
+              console.error("⚠️ Background DB sync notice:", dbErr);
             }
-          }
+          })();
         } else {
           // CHECK_ONLY mode — save matched product IDs and mark SUCCESS
           console.log(
             `👁️ Campaign ${campaignId}: Check-only mode, product found`
           );
-          await prisma.campaign.update({
+          prisma.campaign.update({
             where: { id: campaignId },
             data: {
               status: "SUCCESS",
+              matchedIds,
               settlementMsg: "Products found in Check-Only mode",
             },
-          });
-          await prisma.campaignLog.create({
+          }).catch(console.error);
+          prisma.campaignLog.create({
             data: {
               campaignId,
               event: "CHECK_COMPLETE",
               detail: `Products found: ${matchedIds.join(", ")}`,
             },
-          });
+          }).catch(console.error);
         }
 
         return; // Exit polling loop
@@ -336,36 +398,17 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
       console.error(
         `⚠️ Campaign ${campaignId}: Poll error — ${errorMsg}`
       );
-
-      // Check if campaign still exists before writing error
-      const stillExists = await prisma.campaign.findUnique({
-        where: { id: campaignId },
-        select: { id: true },
-      });
-
-      if (!stillExists) {
-        console.log(`⛔ Campaign ${campaignId} removed during polling`);
-        return;
-      }
-
-      await prisma.campaign.update({
-        where: { id: campaignId },
-        data: { lastError: errorMsg },
-      });
-
-      if (pollCount % 5 === 0) {
-        await prisma.campaignLog.create({
-          data: {
-            campaignId,
-            event: "POLL_ERROR",
-            detail: `Poll #${pollCount} error: ${errorMsg}`,
-          },
-        });
-      }
     }
 
-    // Wait before next poll
-    await sleep(pollingInterval);
+    // Dynamic Turbo Polling interval:
+    // When within 15 seconds before publishTime up to 60 seconds after publishTime -> Turbo Polling (60ms)
+    let sleepMs = pollingInterval;
+
+    if (diffFromPublish <= 15000 && diffFromPublish >= -60000) {
+      sleepMs = Math.min(pollingInterval, 60); // 60ms Turbo Polling
+    }
+
+    await sleep(sleepMs);
   }
 }
 

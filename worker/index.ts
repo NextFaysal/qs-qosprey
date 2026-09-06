@@ -1,4 +1,10 @@
 import "dotenv/config";
+import dns from "node:dns";
+
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
 import { startScheduler } from "./scheduler";
 import { startWorker } from "./polling-worker";
 

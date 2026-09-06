@@ -10,6 +10,7 @@ export function buildHeaders(apiCredential?: string): Record<string, string> {
   const reqHeaders: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json",
+    Connection: "keep-alive",
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
   };
@@ -65,6 +66,7 @@ export async function verifyMemberInfo(
     const response = await fetch(url, {
       method: "GET",
       headers,
+      keepalive: true,
       signal: AbortSignal.timeout(10000),
     });
 
@@ -170,6 +172,7 @@ export async function pollGoodsList(
       method: "POST",
       headers,
       body: JSON.stringify(payload),
+      keepalive: true,
       signal: AbortSignal.timeout(10000), // 10 second timeout
     });
 
@@ -230,7 +233,14 @@ export async function addToCartSingle(
   domain: string,
   id: string | number,
   apiCredential?: string
-): Promise<{ success: boolean; id: string; resCode?: number; message?: string; raw?: unknown }> {
+): Promise<{
+  success: boolean;
+  id: string;
+  resCode?: number;
+  message?: string;
+  raw?: unknown;
+  cartId?: number;
+}> {
   const url = `${domain}/v1/goods/addCart`;
   const headers = buildHeaders(apiCredential);
   const numericId = Number(id);
@@ -240,6 +250,7 @@ export async function addToCartSingle(
       method: "POST",
       headers,
       body: JSON.stringify({ id: isNaN(numericId) ? id : numericId }),
+      keepalive: true,
       signal: AbortSignal.timeout(10000),
     });
 
@@ -248,12 +259,30 @@ export async function addToCartSingle(
     }
 
     const data = await response.json();
+
+    // Inspect if target API returns the newly created cart row ID in ResData
+    let cartId: number | undefined;
+    if (data?.ResData) {
+      if (typeof data.ResData === "number" && data.ResData > 0) {
+        cartId = data.ResData;
+      } else if (typeof data.ResData === "string" && !isNaN(Number(data.ResData))) {
+        cartId = Number(data.ResData);
+      } else if (typeof data.ResData === "object") {
+        if (data.ResData.id && !isNaN(Number(data.ResData.id))) {
+          cartId = Number(data.ResData.id);
+        } else if (data.ResData.cart_id && !isNaN(Number(data.ResData.cart_id))) {
+          cartId = Number(data.ResData.cart_id);
+        }
+      }
+    }
+
     return {
       success: data.ResCode === 1 || data.ResCode === 1002, // 1 = ok, 1002 = already in cart
       id: String(id),
       resCode: data.ResCode,
       message: data.MessageText || "Unknown response",
       raw: data,
+      cartId,
     };
   } catch (error) {
     return {
@@ -265,35 +294,96 @@ export async function addToCartSingle(
 }
 
 /**
- * Add multiple products to cart concurrently one-by-one
+ * Add products to cart in a single batch request: POST /v1/goods/addCart
+ * Body: { id: "39133352,39133358,39133362" }
  */
 export async function addToCart(
   domain: string,
-  ids: string[],
+  ids: (string | number)[],
   apiCredential?: string
 ): Promise<{
   success: boolean;
   resCode?: number;
   message: string;
-  results: Array<{ success: boolean; id: string; resCode?: number; message?: string }>;
-  successCount: number;
+  ids: string[];
+  raw?: unknown;
+  cartIds: number[];
 }> {
-  // Fire all addCart requests concurrently in parallel
-  const results = await Promise.all(
-    ids.map((id) => addToCartSingle(domain, id, apiCredential))
-  );
+  const cleanIds = ids.map(String).map((s) => s.trim()).filter(Boolean);
+  if (cleanIds.length === 0) {
+    return {
+      success: false,
+      message: "No IDs provided",
+      ids: [],
+      cartIds: [],
+    };
+  }
 
-  const successCount = results.filter((r) => r.success).length;
-  const firstSuccessful = results.find((r) => r.success);
-  const summaryMsg = results.map((r) => `#${r.id}: ${r.message}`).join(", ");
+  const url = `${domain.replace(/\/+$/, "")}/v1/goods/addCart`;
+  const headers = buildHeaders(apiCredential);
+  const idsPayload = cleanIds.join(",");
 
-  return {
-    success: successCount > 0,
-    resCode: firstSuccessful?.resCode || (successCount > 0 ? 1 : 1001),
-    message: `${successCount}/${ids.length} added to cart (${summaryMsg})`,
-    results,
-    successCount,
-  };
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ id: idsPayload }),
+      keepalive: true,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      return {
+        success: false,
+        message: `HTTP ${response.status}: ${response.statusText}`,
+        ids: cleanIds,
+        cartIds: [],
+      };
+    }
+
+    const data = await response.json();
+    const isSuccess = data.ResCode === 1 || data.ResCode === 1002; // 1 = ok, 1002 = already in cart
+
+    // Inspect if target API returns newly created cart row IDs in ResData
+    const cartIds: number[] = [];
+    if (data?.ResData) {
+      if (typeof data.ResData === "number" && data.ResData > 0) {
+        cartIds.push(data.ResData);
+      } else if (typeof data.ResData === "string") {
+        data.ResData.split(",").forEach((s: string) => {
+          const num = Number(s.trim());
+          if (!isNaN(num) && num > 0) cartIds.push(num);
+        });
+      } else if (Array.isArray(data.ResData)) {
+        data.ResData.forEach((item: any) => {
+          const cid = typeof item === "object" ? Number(item?.id || item?.cart_id) : Number(item);
+          if (!isNaN(cid) && cid > 0) cartIds.push(cid);
+        });
+      } else if (typeof data.ResData === "object") {
+        if (data.ResData.id && !isNaN(Number(data.ResData.id))) {
+          cartIds.push(Number(data.ResData.id));
+        } else if (data.ResData.cart_id && !isNaN(Number(data.ResData.cart_id))) {
+          cartIds.push(Number(data.ResData.cart_id));
+        }
+      }
+    }
+
+    return {
+      success: isSuccess,
+      resCode: Number(data.ResCode),
+      message: data.MessageText || (isSuccess ? "Operation completed" : "Failed to add to cart"),
+      ids: cleanIds,
+      raw: data,
+      cartIds,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : "Unknown error",
+      ids: cleanIds,
+      cartIds: [],
+    };
+  }
 }
 
 export interface CartItemData {
@@ -319,6 +409,7 @@ export async function getCartLists(
       method: "POST",
       headers,
       body: JSON.stringify({}),
+      keepalive: true,
       signal: AbortSignal.timeout(10000),
     });
 
@@ -356,12 +447,14 @@ export async function getCartLists(
  * Settle/Order Cart Items
  * POST /v1/goods/settlement
  * Body: { ids: "4497726,4497723", is_check: 1 }
+ * Includes zero-delay retry for high-speed reliability
  */
 export async function settleCart(
   domain: string,
   cartRowIds: (string | number)[],
   isCheck: number = 1,
-  apiCredential?: string
+  apiCredential?: string,
+  maxRetries: number = 2
 ): Promise<{ success: boolean; resCode: number; message: string; raw?: unknown }> {
   const url = `${domain.replace(/\/+$/, "")}/v1/goods/settlement`;
   const headers = buildHeaders(apiCredential);
@@ -371,31 +464,41 @@ export async function settleCart(
     is_check: isCheck === 2 ? 2 : 1,
   };
 
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(15000),
-    });
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        keepalive: true,
+        signal: AbortSignal.timeout(10000),
+      });
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const json = await response.json();
+
+      return {
+        success: json.ResCode === 1,
+        resCode: Number(json.ResCode),
+        message: String(json.MessageText || "No response message"),
+        raw: json,
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxRetries) {
+        // Instant retry without delay!
+        continue;
+      }
     }
-
-    const json = await response.json();
-
-    return {
-      success: json.ResCode === 1,
-      resCode: Number(json.ResCode),
-      message: String(json.MessageText || "No response message"),
-      raw: json,
-    };
-  } catch (error) {
-    throw new Error(
-      `Settlement failed: ${error instanceof Error ? error.message : "Unknown error"}`
-    );
   }
+
+  throw new Error(
+    `Settlement failed after retries: ${lastError instanceof Error ? lastError.message : "Unknown error"}`
+  );
 }
 
 /**

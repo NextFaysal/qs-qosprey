@@ -94,7 +94,7 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
   let lastCheckedAtDbUpdate = 0;
   let cartPreCleaned = false;
 
-  // Auto pre-clean cart in background before drop (ensures clean state for fast matching)
+  // Auto pre-clean cart in background ONLY if scheduled well ahead of drop time (>15s before publishTime)
   const preCleanCart = async () => {
     if (cartPreCleaned || mode !== "AUTO_BUY" || !apiCredential) return;
     cartPreCleaned = true;
@@ -111,7 +111,9 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
     }
   };
 
-  preCleanCart().catch(() => {});
+  if (publishTimeMs - Date.now() > 15000) {
+    preCleanCart().catch(() => {});
+  }
 
   // Log polling start
   await prisma.campaignLog.create({
@@ -241,7 +243,7 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
               `⚡ [SNIPER] Direct Cart IDs extracted from addCart response in 0ms: [${targetCartIds.join(", ")}]`
             );
           } else {
-            // Await the overlapped cart lists request that was already traveling across the network
+            // Await the overlapped cart lists request that was traveling across the network
             let cartListsResult;
             try {
               cartListsResult = await overlappedCartListsPromise;
@@ -249,38 +251,47 @@ async function processCampaignJob(job: Job<CampaignJobData>) {
               cartListsResult = await getCartLists(domain, apiCredential);
             }
             console.log(
-              `📋 [SNIPER] Overlapped CartLists resolved in ${Date.now() - pipelineStart}ms (${cartListsResult?.items?.length || 0} items)`
+              `📋 [SNIPER] Overlapped CartLists returned in ${Date.now() - pipelineStart}ms (${cartListsResult?.items?.length || 0} items in cart)`
             );
 
-            if (cartListsResult?.items && cartListsResult.items.length > 0) {
+            const resolveTargetCartIds = (items: typeof cartListsResult.items) => {
+              if (!items || items.length === 0) return [];
               const matchedStrIds = matchedIds.map(String);
               const matchedNumIds = matchedIds.map(Number);
 
-              // Strictly match ONLY the specific products filtered and added by THIS campaign
-              let matchingItems = cartListsResult.items.filter(
+              const matchingItems = items.filter(
                 (item) =>
                   matchedNumIds.includes(item.card_id) ||
                   matchedStrIds.includes(String(item.card_id))
               );
 
-              // If overlapped request hit a few milliseconds before remote DB commit, do an instant retry:
-              if (matchingItems.length === 0) {
-                const retryCart = await getCartLists(domain, apiCredential);
-                matchingItems = (retryCart.items || []).filter(
-                  (item) =>
-                    matchedNumIds.includes(item.card_id) ||
-                    matchedStrIds.includes(String(item.card_id))
-                );
-                if (matchingItems.length > 0) {
-                  cartListsResult = retryCart;
-                }
-              }
-
               if (matchingItems.length > 0) {
-                targetCartIds = matchingItems.map((item) => item.id);
-              } else {
-                // If ID representation differed on target server, take latest items up to campaign quantity
-                targetCartIds = cartListsResult.items.slice(0, quantity).map((item) => item.id);
+                return matchingItems.map((item) => item.id);
+              }
+              // If exact card_id did not map, take latest up to quantity items
+              return items.slice(0, quantity).map((item) => item.id);
+            };
+
+            targetCartIds = resolveTargetCartIds(cartListsResult?.items || []);
+
+            // SMART FAST-RETRY: If cart was empty (overlapped request arrived before server DB committed addCart),
+            // retry up to 3 times rapidly (50ms, 80ms, 120ms)!
+            let retryCount = 0;
+            while (targetCartIds.length === 0 && retryCount < 3) {
+              retryCount++;
+              const retryDelay = retryCount * 50;
+              console.log(
+                `🔄 [SNIPER] Cart empty, retrying getCartLists #${retryCount}/3 after ${retryDelay}ms...`
+              );
+              await sleep(retryDelay);
+              try {
+                const freshCart = await getCartLists(domain, apiCredential);
+                console.log(
+                  `📋 [SNIPER] Retry #${retryCount} returned ${freshCart.items.length} items`
+                );
+                targetCartIds = resolveTargetCartIds(freshCart.items);
+              } catch (retryErr) {
+                console.error(`⚠️ Cart retry #${retryCount} error:`, retryErr);
               }
             }
           }

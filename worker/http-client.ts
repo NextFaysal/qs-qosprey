@@ -420,13 +420,36 @@ export async function getCartLists(
     const json = await response.json();
     const items: CartItemData[] = [];
 
-    if (json.ResCode === 1 && json.ResData?.data && Array.isArray(json.ResData.data)) {
-      for (const item of json.ResData.data) {
+    let rawList: unknown[] = [];
+    if (json.ResCode === 1) {
+      if (json.ResData?.data && Array.isArray(json.ResData.data)) {
+        rawList = json.ResData.data;
+      } else if (json.ResData && Array.isArray(json.ResData)) {
+        rawList = json.ResData;
+      } else if (json.data && Array.isArray(json.data)) {
+        rawList = json.data;
+      } else if (json.ResData?.list && Array.isArray(json.ResData.list)) {
+        rawList = json.ResData.list;
+      } else if (json.list && Array.isArray(json.list)) {
+        rawList = json.list;
+      }
+    }
+
+    for (const item of rawList) {
+      if (!item || typeof item !== "object") continue;
+      const it = item as Record<string, unknown>;
+      const rawId = it.id ?? it.Id ?? it.cart_id ?? it.cartId;
+      const rawCardId = it.card_id ?? it.cardId ?? it.goods_id ?? it.goodId ?? it.goodsId ?? it.id;
+
+      const id = Number(rawId);
+      const card_id = Number(rawCardId);
+
+      if (!isNaN(id)) {
         items.push({
-          id: Number(item.id),
-          card_id: Number(item.card_id),
-          user_id: item.user_id ? Number(item.user_id) : undefined,
-          createtime: item.createtime ? Number(item.createtime) : undefined,
+          id,
+          card_id: !isNaN(card_id) ? card_id : id,
+          user_id: it.user_id ? Number(it.user_id) : undefined,
+          createtime: it.createtime ? Number(it.createtime) : undefined,
         });
       }
     }
